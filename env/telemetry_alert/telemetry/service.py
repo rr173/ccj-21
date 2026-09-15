@@ -7,7 +7,11 @@
 * 滚动窗口 [start, end)。watermark >= window_end 时窗口封存并评估命中；
   watermark >= window_end + allowed_lateness 后窗口封板，之后到达的
   事件只能进入隔离列表，不能改动已封存结果。
-* 窗口在创建时绑定当时生效的规则版本，之后规则更新不会重新解释该窗口。
+* 每个事件按自身事件时间命中当时生效的规则版本：窗口按
+  (device, metric, rule_id, rule_version, window_start) 归属。
+  新版本在窗口中途生效时，生效后的事件进入新版本窗口，同一起点的新旧
+  版本窗口可以并存；已归属旧版本的窗口与事件永远按旧版本解释
+  （查询、迟到修正、告警判定均沿用窗口/事件绑定的版本）。
 * 告警周期由"已封存窗口序列"确定性重放得出；迟到修正改变窗口结论后
   重新重放并与库中周期对齐，修正前后原因写入 alert_corrections，
   已发出的通知记录永不删除。
@@ -18,6 +22,7 @@ import json
 import math
 import time
 import uuid
+from itertools import groupby
 
 from .storage import Database
 
@@ -94,6 +99,9 @@ def compute_periods(windows):
         if prev is not None:
             size = prev["window_size"]
             gap = int(round((w["window_start"] - (prev["window_start"] + size)) / size))
+            # 规则版本切换时并存窗口可能在时间轴上重叠（gap 为负）：
+            # 重叠部分没有缺失窗口，直接继续；只有正缺口才补非命中窗口
+            gap = max(gap, 0)
             if gap > 0:
                 # 逐个逻辑经过缺失窗口；告警关闭后剩余缺口不再影响状态
                 k = 0
@@ -421,24 +429,26 @@ class TelemetryService:
         else:
             group_id = device["group_id"]
 
-        # 3) 事件时间对应的规则版本
+        # 3) 事件按自身事件时间命中当时生效的规则版本
         rule = self._rule_for(conn, group_id, metric, event_time)
         if rule is None:
             conn.execute(
                 """INSERT INTO events(event_id, device_id, metric, value, event_time,
-                   received_at, status, reason, window_start)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                   received_at, status, reason, window_start, rule_id, rule_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (event_id, device_id, metric, value, event_time, now,
-                 EVENT_NO_RULE, "no effective rule for event time", None),
+                 EVENT_NO_RULE, "no effective rule for event time", None, None, None),
             )
             return {"event_id": event_id, "status": EVENT_NO_RULE,
                     "reason": "no effective rule for event time"}
 
+        # 窗口身份包含事件命中的规则版本：版本在窗口中途生效、或窗口长度
+        # 变化导致新旧窗口起点相同时，生效后的事件进入自己版本的窗口，
+        # 不会被同起点的旧窗口吞掉
         ws = _window_start_of(event_time, rule["window_size_sec"])
-        win = conn.execute(
-            "SELECT * FROM windows WHERE device_id=? AND metric=? AND window_start=?",
-            (device_id, metric, ws),
-        ).fetchone()
+        win = self._get_window(
+            conn, device_id, metric, ws, rule["rule_id"], rule["version"]
+        )
         if win is not None:
             # 窗口已存在：沿用窗口绑定的规则版本，不被后续规则更新重新解释
             rule = self._rule_by_version(conn, win["rule_id"], win["rule_version"])
@@ -446,7 +456,8 @@ class TelemetryService:
         else:
             we = ws + rule["window_size_sec"]
 
-        # 4) 超过允许迟到期：只能隔离，不能改动已封存结果
+        # 4) 超过允许迟到期：只能隔离，不能改动已封存结果（用事件绑定版本
+        #    自身的 allowed_lateness 判定）
         wm = self._watermark(conn, device_id, metric)
         if wm >= we + rule["allowed_lateness_sec"]:
             reason = (
@@ -455,21 +466,21 @@ class TelemetryService:
             )
             conn.execute(
                 """INSERT INTO events(event_id, device_id, metric, value, event_time,
-                   received_at, status, reason, window_start)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                   received_at, status, reason, window_start, rule_id, rule_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (event_id, device_id, metric, value, event_time, now,
-                 EVENT_QUARANTINED, reason, ws),
+                 EVENT_QUARANTINED, reason, ws, rule["rule_id"], rule["version"]),
             )
             return {"event_id": event_id, "status": EVENT_QUARANTINED,
                     "reason": reason, "window_start": ws}
 
-        # 5) 接受：落库、推进水位线、进入窗口
+        # 5) 接受：落库（记住命中的规则版本）、推进水位线、进入窗口
         conn.execute(
             """INSERT INTO events(event_id, device_id, metric, value, event_time,
-               received_at, status, reason, window_start)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+               received_at, status, reason, window_start, rule_id, rule_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (event_id, device_id, metric, value, event_time, now,
-             EVENT_ACCEPTED, None, ws),
+             EVENT_ACCEPTED, None, ws, rule["rule_id"], rule["version"]),
         )
         streams.add((device_id, metric))
         conn.execute(
@@ -497,15 +508,18 @@ class TelemetryService:
         elif not win["sealed"]:
             self._recalc_window(conn, device_id, metric, ws, rule, now)
         else:
-            # 6) 水位线之前、仍在允许迟到期内：重算窗口并留下修正记录
+            # 6) 水位线之前、仍在允许迟到期内：事件已落库，重算其绑定版本
+            #    的窗口并留下修正记录
             old_agg, old_hit = win["agg_value"], win["hit"]
             new_agg, _ = self._recalc_window(conn, device_id, metric, ws, rule, now)
             new_hit = self._hit(rule, new_agg)
             if new_agg != old_agg or new_hit != bool(old_hit or 0):
                 conn.execute(
                     """UPDATE windows SET hit=?, updated_at=?
-                       WHERE device_id=? AND metric=? AND window_start=?""",
-                    (1 if new_hit else 0, now, device_id, metric, ws),
+                       WHERE device_id=? AND metric=? AND window_start=?
+                         AND rule_id=? AND rule_version=?""",
+                    (1 if new_hit else 0, now, device_id, metric, ws,
+                     rule["rule_id"], rule["version"]),
                 )
                 conn.execute(
                     """INSERT INTO window_corrections(device_id, metric, window_start,
@@ -534,12 +548,27 @@ class TelemetryService:
         ).fetchone()
         return row["max_event_time"] if row else float("-inf")
 
+    @staticmethod
+    def _get_window(conn, device_id, metric, ws, rule_id, rule_version):
+        """按完整窗口身份（含规则版本）取窗口。"""
+        return conn.execute(
+            """SELECT * FROM windows
+               WHERE device_id=? AND metric=? AND window_start=?
+                 AND rule_id=? AND rule_version=?""",
+            (device_id, metric, ws, rule_id, rule_version),
+        ).fetchone()
+
     def _recalc_window(self, conn, device_id, metric, ws, rule, now):
-        """从已接受事件重算窗口聚合值（幂等；迟到修正也走这里）。"""
+        """从已接受事件重算窗口聚合值（幂等；迟到修正也走这里）。
+
+        只统计事件时间命中了窗口所绑定规则版本的事件——同起点的新旧版本
+        窗口并存时，各版本只聚合自己版本的事件。
+        """
         rows = conn.execute(
             """SELECT value, event_time, event_id FROM events
-               WHERE device_id=? AND metric=? AND window_start=? AND status='accepted'""",
-            (device_id, metric, ws),
+               WHERE device_id=? AND metric=? AND window_start=? AND status='accepted'
+                 AND rule_id=? AND rule_version=?""",
+            (device_id, metric, ws, rule["rule_id"], rule["version"]),
         ).fetchall()
         agg = rule["aggregation"]
         if not rows:
@@ -561,8 +590,10 @@ class TelemetryService:
             raise RuleError(f"unknown aggregation {agg}")
         conn.execute(
             """UPDATE windows SET agg_value=?, event_count=?, updated_at=?
-               WHERE device_id=? AND metric=? AND window_start=?""",
-            (agg_value, len(rows), now, device_id, metric, ws),
+               WHERE device_id=? AND metric=? AND window_start=?
+                 AND rule_id=? AND rule_version=?""",
+            (agg_value, len(rows), now, device_id, metric, ws,
+             rule["rule_id"], rule["version"]),
         )
         return agg_value, len(rows)
 
@@ -575,20 +606,23 @@ class TelemetryService:
     def _seal_window(self, conn, device_id, metric, ws, rule, now):
         agg = conn.execute(
             "SELECT agg_value FROM windows WHERE device_id=? AND metric=? "
-            "AND window_start=?",
-            (device_id, metric, ws),
+            "AND window_start=? AND rule_id=? AND rule_version=?",
+            (device_id, metric, ws, rule["rule_id"], rule["version"]),
         ).fetchone()["agg_value"]
         conn.execute(
             """UPDATE windows SET sealed=1, sealed_at=?, hit=?, updated_at=?
-               WHERE device_id=? AND metric=? AND window_start=?""",
-            (now, 1 if self._hit(rule, agg) else 0, now, device_id, metric, ws),
+               WHERE device_id=? AND metric=? AND window_start=?
+                 AND rule_id=? AND rule_version=?""",
+            (now, 1 if self._hit(rule, agg) else 0, now, device_id, metric, ws,
+             rule["rule_id"], rule["version"]),
         )
 
     def _seal_due_windows(self, conn, device_id, metric, now, chains):
         wm = self._watermark(conn, device_id, metric)
         rows = conn.execute(
             """SELECT * FROM windows WHERE device_id=? AND metric=? AND sealed=0
-               AND window_end<=? ORDER BY window_start""",
+               AND window_end<=?
+               ORDER BY rule_id, rule_version, window_start""",
             (device_id, metric, wm),
         ).fetchall()
         for win in rows:
@@ -603,32 +637,39 @@ class TelemetryService:
         device_id, metric, rule_id = chain
         rows = conn.execute(
             """SELECT w.window_start, w.window_end, w.agg_value, w.hit,
+                      w.rule_version,
                       r.consecutive_hits, r.recovery_count, r.silence_sec,
                       r.operator, r.threshold, r.metric AS rule_metric
                FROM windows w
                JOIN rules r ON r.rule_id=w.rule_id AND r.version=w.rule_version
                WHERE w.device_id=? AND w.metric=? AND w.rule_id=? AND w.sealed=1
-               ORDER BY w.window_start""",
+               ORDER BY w.rule_version, w.window_start""",
             (device_id, metric, rule_id),
         ).fetchall()
-        windows = [
-            {
-                "window_start": r["window_start"],
-                "window_size": r["window_end"] - r["window_start"],
-                "hit": bool(r["hit"]),
-                "agg_value": r["agg_value"],
-                "params": {
-                    "consecutive_hits": r["consecutive_hits"],
-                    "recovery_count": r["recovery_count"],
-                    "silence_sec": r["silence_sec"],
-                    "operator": r["operator"],
-                    "threshold": r["threshold"],
-                    "metric": r["rule_metric"],
-                },
-            }
-            for r in rows
-        ]
-        computed = compute_periods(windows)
+        # 每个规则版本独立重放：版本在窗口中途生效时并存窗口各算各的，
+        # 连续命中/恢复/静默都只采用本版本参数，不跨版本累计
+        computed = []
+        for version, group in groupby(rows, key=lambda r: r["rule_version"]):
+            windows = [
+                {
+                    "window_start": r["window_start"],
+                    "window_size": r["window_end"] - r["window_start"],
+                    "hit": bool(r["hit"]),
+                    "agg_value": r["agg_value"],
+                    "params": {
+                        "consecutive_hits": r["consecutive_hits"],
+                        "recovery_count": r["recovery_count"],
+                        "silence_sec": r["silence_sec"],
+                        "operator": r["operator"],
+                        "threshold": r["threshold"],
+                        "metric": r["rule_metric"],
+                    },
+                }
+                for r in group
+            ]
+            for p in compute_periods(windows):
+                p["rule_version"] = version
+                computed.append(p)
         self._apply_periods(conn, chain, computed, trigger, now)
 
     def _apply_periods(self, conn, chain, computed, trigger, now):
@@ -637,23 +678,25 @@ class TelemetryService:
         device_id, metric, rule_id = chain
         stored = conn.execute(
             "SELECT * FROM alert_periods WHERE device_id=? AND rule_id=? "
-            "ORDER BY opened_at, rowid",
+            "ORDER BY rule_version, opened_at, rowid",
             (device_id, rule_id),
         ).fetchall()
-        by_open = {p["opened_at"]: p for p in stored}
+        # 同一开窗时间、不同规则版本的周期是各自独立的告警
+        by_open = {(p["opened_at"], p["rule_version"]): p for p in stored}
         matched = set()
 
         for c in computed:
-            s = by_open.get(c["opened_at"])
+            key = (c["opened_at"], c["rule_version"])
+            s = by_open.get(key)
             if s is None:
                 alert_id = _uuid()
                 conn.execute(
                     """INSERT INTO alert_periods(alert_id, device_id, metric, rule_id,
-                       status, opened_at, closed_at, open_reason, close_reason,
-                       hit_count, last_hit_window, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (alert_id, device_id, metric, rule_id, c["status"],
-                     c["opened_at"], c["closed_at"], c["open_reason"],
+                       rule_version, status, opened_at, closed_at, open_reason,
+                       close_reason, hit_count, last_hit_window, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (alert_id, device_id, metric, rule_id, c["rule_version"],
+                     c["status"], c["opened_at"], c["closed_at"], c["open_reason"],
                      c["close_reason"], c["hit_count"], c["last_hit_window"],
                      now, now),
                 )
@@ -746,6 +789,7 @@ class TelemetryService:
                         "open_reason": s["open_reason"],
                         "close_reason": "invalidated by late-data correction",
                         "last_hit_window": s["last_hit_window"],
+                        "rule_version": s["rule_version"],
                     },
                     trigger, now,
                     before=s["open_reason"],
@@ -767,6 +811,7 @@ class TelemetryService:
             "alert_id": alert_id,
             "device_id": device_id,
             "rule_id": rule_id,
+            "rule_version": period.get("rule_version"),
             "metric": metric,
             "type": ntype,
             "trigger": trigger,
@@ -905,7 +950,7 @@ class TelemetryService:
         if metric is not None:
             sql += " AND metric=?"
             args.append(metric)
-        sql += " ORDER BY device_id, metric, window_start"
+        sql += " ORDER BY device_id, metric, rule_id, rule_version, window_start"
         return [dict(r) for r in self.db.query(sql, args)]
 
     def list_alerts(self, device_id=None, rule_id=None, status=None):
@@ -919,7 +964,7 @@ class TelemetryService:
         if status is not None:
             sql += " AND status=?"
             args.append(status)
-        sql += " ORDER BY opened_at, alert_id"
+        sql += " ORDER BY rule_id, rule_version, opened_at, alert_id"
         return [dict(r) for r in self.db.query(sql, args)]
 
     def list_window_corrections(self, device_id=None, metric=None):

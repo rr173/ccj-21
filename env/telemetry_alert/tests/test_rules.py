@@ -1,4 +1,9 @@
-"""规则版本化：生效时间、窗口绑定规则版本、更新后旧窗口不被重新解释。"""
+"""规则版本化：生效时间、窗口绑定规则版本、更新后旧窗口不被重新解释。
+
+特别覆盖：新版本在窗口中途生效、或窗口长度变化导致新旧窗口起点相同时，
+生效后的事件必须按自身事件时间进入新版本窗口（同起点新旧窗口并存），
+已归属旧版本的事件/窗口/修正/告警始终沿用旧版本。
+"""
 import unittest
 
 from helpers import ServiceTestCase
@@ -95,6 +100,135 @@ class TestRules(ServiceTestCase):
         self.assertEqual(res["status"], "no_rule")
         ev = self.svc.get_event(res["event_id"])
         self.assertEqual(ev["status"], "no_rule")
+
+    def test_event_uses_effective_version_when_version_takes_effect_inside_window(self):
+        """版本在窗口中途生效：生效后的事件进入新版本窗口，旧版本窗口
+        保留切换前数据；迟到事件仍修正旧版本窗口。"""
+        rid = self.make_rule(threshold=80.0, consecutive_hits=1,
+                             allowed_lateness_sec=300)["rule_id"]
+        self.svc.register_device("d1", "g1")
+        # t=10 -> v1 窗口 [0,60)
+        self.ingest_ok(self.ev(value=90.0, t=10.0))
+        # v2 在 90 生效，落在同一长度窗口 [60,120) 的中途
+        self.svc.update_rule(rid, effective_from=90.0, threshold=50.0)
+        # t=100 必须命中 v2 窗口 [60,120)；t=200 推进水位线封存两窗口
+        self.ingest_ok([
+            self.ev(value=60.0, t=100.0),
+            self.ev(value=1.0, t=200.0),
+        ])
+        windows = {
+            (w["window_start"], w["rule_version"]): w
+            for w in self.svc.list_windows("d1", "cpu")
+        }
+        self.assertEqual(set(windows), {(0.0, 1), (60.0, 2), (180.0, 2)})
+        self.assertEqual(windows[(60.0, 2)]["event_count"], 1)
+        self.assertEqual(windows[(60.0, 2)]["agg_value"], 60.0)
+        self.assertEqual(windows[(60.0, 2)]["hit"], 1)   # v2 阈值 50
+        # 生效后的事件返回其绑定版本，不被旧版本窗口吞掉
+        bound = {
+            e["event_time"]: e["rule_version"]
+            for e in self.svc.list_events("d1")
+        }
+        self.assertEqual(bound[100.0], 2)
+        # 迟到事件 t=20 只能修正它自己版本(v1)的窗口，聚合值/结论按 v1
+        self.ingest_ok(self.ev(value=30.0, t=20.0))
+        windows = {
+            (w["window_start"], w["rule_version"]): w
+            for w in self.svc.list_windows("d1", "cpu")
+        }
+        v1, v2 = windows[(0.0, 1)], windows[(60.0, 2)]
+        self.assertEqual(v1["event_count"], 2)
+        self.assertEqual(v1["agg_value"], 60.0)          # (90+30)/2
+        self.assertEqual(v1["hit"], 0)                   # v1 阈值 80，不命中
+        self.assertEqual(v2["event_count"], 1)
+        self.assertEqual(v2["agg_value"], 60.0)
+        self.assertEqual(v2["hit"], 1)                   # v2 结论不受影响
+        late = [e for e in self.svc.list_events("d1")
+                if e["event_time"] == 20.0][0]
+        self.assertEqual((late["rule_id"], late["rule_version"]),
+                         (rid, 1))
+        corr = self.svc.list_window_corrections("d1")
+        self.assertEqual(len(corr), 1)
+        self.assertEqual((corr[0]["window_start"], corr[0]["rule_version"]),
+                         (0.0, 1))
+        self.assertEqual((corr[0]["old_agg"], corr[0]["new_agg"]),
+                         (90.0, 60.0))
+        self.assertEqual((corr[0]["old_hit"], corr[0]["new_hit"]), (1, 0))
+
+        # 告警判定：v1 旧结论被修正推翻（invalidated 保留），v2 命中开新周期
+        alerts = {a["opened_at"]: a for a in self.svc.list_alerts(device_id="d1")}
+        self.assertEqual(alerts[0.0]["status"], "invalidated")
+        self.assertEqual(alerts[60.0]["status"], "open")
+        acorr = self.svc.list_alert_corrections(alerts[0.0]["alert_id"])
+        self.assertEqual(acorr[0]["correction_type"], "invalidated")
+
+    def test_same_start_windows_coexist_when_window_size_changes(self):
+        """窗口长度变化且新旧窗口起点相同：新版本事件进入新版本窗口，
+        旧窗口不能吞掉新版本事件；迟到修正仍落在旧版本窗口。"""
+        rid = self.make_rule(window_size_sec=60, threshold=80.0,
+                             consecutive_hits=1, allowed_lateness_sec=300)["rule_id"]
+        self.svc.register_device("d1", "g1")
+        # t=30 -> v1 [0,60)
+        self.ingest_ok(self.ev(value=90.0, t=30.0))
+        # v2 自 100 生效、窗口长度 120：v2 的 [0,120) 与 v1 的 [0,60) 起点相同
+        self.svc.update_rule(rid, effective_from=100.0,
+                             window_size_sec=120, threshold=50.0)
+        # t=110 -> v2 [0,120)；t=130 -> v2 [120,240)；t=300 封存
+        self.ingest_ok([
+            self.ev(value=60.0, t=110.0),
+            self.ev(value=60.0, t=130.0),
+            self.ev(value=1.0, t=300.0),
+        ])
+        windows = {
+            (w["window_start"], w["rule_version"]): w
+            for w in self.svc.list_windows("d1", "cpu")
+        }
+        # 同一起点 0.0 上新旧两个窗口必须并存
+        self.assertIn((0.0, 1), windows)
+        self.assertIn((0.0, 2), windows)
+        self.assertEqual(windows[(0.0, 2)]["window_end"], 120.0)
+        self.assertEqual(windows[(0.0, 2)]["event_count"], 1)
+        self.assertEqual(windows[(0.0, 2)]["agg_value"], 60.0)
+        self.assertEqual(windows[(120.0, 2)]["event_count"], 1)
+
+        # 迟到 t=40 仍按 v1 修正旧窗口，不被同起点的 v2 窗口吞掉
+        self.ingest_ok(self.ev(value=30.0, t=40.0))
+        windows = {
+            (w["window_start"], w["rule_version"]): w
+            for w in self.svc.list_windows("d1", "cpu")
+        }
+        v1, v2 = windows[(0.0, 1)], windows[(0.0, 2)]
+        self.assertEqual(v1["event_count"], 2)
+        self.assertEqual(v1["agg_value"], 60.0)
+        self.assertEqual(v1["hit"], 0)              # v1 阈值 80
+        self.assertEqual(v2["event_count"], 1)
+        self.assertEqual(v2["agg_value"], 60.0)     # v2 不混入迟到事件
+        self.assertEqual(v2["hit"], 1)              # v2 阈值 50
+        corr = self.svc.list_window_corrections("d1")
+        self.assertEqual(len(corr), 1)
+        self.assertEqual((corr[0]["window_start"], corr[0]["rule_version"]),
+                         (0.0, 1))
+
+    def test_lateness_checked_with_events_bound_version(self):
+        """允许迟到期按事件绑定版本各自判定。"""
+        rid = self.make_rule(allowed_lateness_sec=0)["rule_id"]
+        self.svc.register_device("d1", "g1")
+        self.ingest_ok([
+            self.ev(value=90.0, t=10.0),
+            self.ev(value=1.0, t=200.0),
+        ])
+        # v1 窗口 [0,60) 在水位线 200 时已封板
+        self.svc.update_rule(rid, effective_from=100.0,
+                             allowed_lateness_sec=1000.0)
+        # 生效前的事件 t=20 用 v1（零迟到），必须隔离
+        old = self.ingest_ok(self.ev(value=1.0, t=20.0))[0]
+        self.assertEqual(old["status"], "quarantined")
+        self.assertEqual(old["rule_version"] if "rule_version" in old else None,
+                         None)
+        # 生效后的事件 t=110 用 v2 的迟到设置，正常接收
+        new = self.ingest_ok(self.ev(value=1.0, t=110.0))[0]
+        self.assertEqual(new["status"], "accepted")
+        self.assertEqual(new["rule_version"], 2)
 
 
 if __name__ == "__main__":

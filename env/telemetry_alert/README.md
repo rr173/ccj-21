@@ -10,7 +10,7 @@
 # 启动控制端服务（仅依赖 Python 3.11 标准库）
 python3 -m telemetry --db telemetry.db --port 8080 [--webhook URL]
 
-# 运行测试（56 个用例）
+# 运行测试（59 个用例）
 python3 -m unittest discover -s tests
 ```
 
@@ -21,8 +21,12 @@ python3 -m unittest discover -s tests
   （sum/avg/min/max/count/last）、比较符与阈值、连续命中次数、恢复条件
   （连续未命中窗口数）、静默期、允许迟到时间、生效时间。
 - `POST /rules/{id}/versions` 产生新版本：旧版本生效区间在 `effective_from`
-  处截止，新版本自此生效。**窗口在创建时绑定当时生效的规则版本**，
-  之后规则更新不会重新解释已归属旧版本的窗口（修正也沿用窗口绑定版本）。
+  处截止，新版本自此生效。**每个事件按自身事件时间命中当时生效的版本**：
+  窗口按 `(device, metric, rule_id, rule_version, window_start)` 归属，
+  即使新版本在窗口中途生效、或窗口长度变化导致新旧窗口起点相同，生效后的
+  事件也进入新版本窗口（同起点新旧窗口并存），不会被旧窗口吞掉；切换前
+  已归属旧版本的事件与窗口永远按旧版本解释——查询、迟到修正、告警判定
+  都沿用各自绑定的规则版本（修正也只重算事件所绑定版本的窗口）。
 
 ### 摄入、水位线与迟到
 - 事件必须携带唯一 `event_id` 与设备时间 `event_time`；同一 `event_id`
@@ -84,6 +88,6 @@ telemetry/
   notify.py    # 可插拔投递通道（webhook / 文件 / 自定义可调用）
   api.py       # 控制端 HTTP API（标准库 http.server）
   __main__.py  # 服务入口
-tests/         # 56 个用例：规则版本、摄入语义、告警生命周期、
+tests/         # 59 个用例：规则版本、摄入语义、告警生命周期、
                # 迟到修正、通知投递、重启恢复、HTTP 端到端
 ```

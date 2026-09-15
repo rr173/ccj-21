@@ -37,18 +37,21 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    event_id    TEXT PRIMARY KEY,
-    device_id   TEXT NOT NULL,
-    metric      TEXT NOT NULL,
-    value       REAL NOT NULL,
-    event_time  REAL NOT NULL,
-    received_at REAL NOT NULL,
-    status      TEXT NOT NULL,          -- accepted | quarantined | no_rule
-    reason      TEXT,
-    window_start REAL
+    event_id     TEXT PRIMARY KEY,
+    device_id    TEXT NOT NULL,
+    metric       TEXT NOT NULL,
+    value        REAL NOT NULL,
+    event_time   REAL NOT NULL,
+    received_at  REAL NOT NULL,
+    status       TEXT NOT NULL,          -- accepted | quarantined | no_rule
+    reason       TEXT,
+    window_start REAL,
+    rule_id      TEXT,                   -- 事件按自身事件时间命中的规则版本
+    rule_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_events_window
-    ON events(device_id, metric, window_start) WHERE status = 'accepted';
+    ON events(device_id, metric, window_start, rule_id, rule_version)
+    WHERE status = 'accepted';
 CREATE INDEX IF NOT EXISTS ix_events_status ON events(status);
 
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -72,8 +75,12 @@ CREATE TABLE IF NOT EXISTS windows (
     sealed_at    REAL,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
-    PRIMARY KEY (device_id, metric, window_start)
+    -- 同一规则版本下窗口起点唯一；不同规则版本即使起点相同也是各自的窗口，
+    -- 因为版本在窗口中途生效时，新旧版本窗口会并存
+    PRIMARY KEY (device_id, metric, rule_id, rule_version, window_start)
 );
+CREATE INDEX IF NOT EXISTS ix_windows_open
+    ON windows(device_id, metric, sealed, window_end);
 
 CREATE TABLE IF NOT EXISTS window_corrections (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +103,7 @@ CREATE TABLE IF NOT EXISTS alert_periods (
     device_id       TEXT NOT NULL,
     metric          TEXT NOT NULL,
     rule_id         TEXT NOT NULL,
+    rule_version    INTEGER NOT NULL DEFAULT 1,  -- 告警判定所绑定的规则版本
     status          TEXT NOT NULL,      -- open | closed | invalidated
     opened_at       REAL NOT NULL,      -- 触发告警的窗口起点(事件时间)
     closed_at       REAL,
@@ -107,6 +115,8 @@ CREATE TABLE IF NOT EXISTS alert_periods (
     updated_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_device ON alert_periods(device_id, rule_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_version
+    ON alert_periods(device_id, rule_id, rule_version, opened_at);
 
 CREATE TABLE IF NOT EXISTS alert_corrections (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,8 +171,143 @@ class Database:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._lock = threading.RLock()
         with self._lock:
+            self._migrate(self.conn)
             self.conn.executescript(SCHEMA)
             self.conn.commit()
+
+    @staticmethod
+    def _migrate(conn):
+        """旧版本库结构升级：事件补记命中的规则版本；窗口主键加入规则版本，
+        使版本在窗口中途生效时同起点的新旧窗口可以并存。"""
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "events" in tables:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+            if "rule_id" not in cols:
+                conn.execute("ALTER TABLE events ADD COLUMN rule_id TEXT")
+            if "rule_version" not in cols:
+                conn.execute("ALTER TABLE events ADD COLUMN rule_version INTEGER")
+            # 旧索引只按 window_start：删掉后由 SCHEMA 按新列重建
+            conn.execute("DROP INDEX IF EXISTS ix_events_window")
+        if "windows" in tables:
+            ddl = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='windows'"
+            ).fetchone()[0] or ""
+            if "rule_id, rule_version, window_start" not in ddl:
+                # 旧主键 (device_id, metric, window_start) 无法容纳同起点、
+                # 不同规则版本的并存窗口：重建表并搬移既有窗口
+                conn.execute("ALTER TABLE windows RENAME TO windows_legacy_v1")
+                conn.execute(
+                    """CREATE TABLE windows (
+                        device_id    TEXT NOT NULL,
+                        metric       TEXT NOT NULL,
+                        window_start REAL NOT NULL,
+                        window_end   REAL NOT NULL,
+                        rule_id      TEXT NOT NULL,
+                        rule_version INTEGER NOT NULL,
+                        agg_value    REAL,
+                        event_count  INTEGER NOT NULL DEFAULT 0,
+                        hit          INTEGER,
+                        sealed       INTEGER NOT NULL DEFAULT 0,
+                        sealed_at    REAL,
+                        created_at   REAL NOT NULL,
+                        updated_at   REAL NOT NULL,
+                        PRIMARY KEY (device_id, metric, rule_id, rule_version,
+                                     window_start)
+                    )"""
+                )
+                conn.execute(
+                    """INSERT INTO windows(device_id, metric, window_start,
+                           window_end, rule_id, rule_version, agg_value,
+                           event_count, hit, sealed, sealed_at, created_at,
+                           updated_at)
+                       SELECT device_id, metric, window_start, window_end,
+                              rule_id, rule_version, agg_value, event_count,
+                              hit, sealed, sealed_at, created_at, updated_at
+                       FROM windows_legacy_v1"""
+                )
+                conn.execute("DROP TABLE windows_legacy_v1")
+
+        if "alert_periods" in tables:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(alert_periods)")}
+            if "rule_version" not in cols:
+                # 旧告警周期没有版本列：按开窗窗口起点回填其绑定版本；
+                # 回填不到（窗口已不在）时退回该规则的最新版本
+                conn.execute("ALTER TABLE alert_periods ADD COLUMN rule_version INTEGER")
+                conn.execute(
+                    """UPDATE alert_periods
+                       SET rule_version = COALESCE((
+                               SELECT w.rule_version FROM windows w
+                               WHERE w.device_id = alert_periods.device_id
+                                 AND w.metric = alert_periods.metric
+                                 AND w.rule_id = alert_periods.rule_id
+                                 AND w.window_start = alert_periods.opened_at
+                           ), (
+                               SELECT MAX(r.version) FROM rules r
+                               WHERE r.rule_id = alert_periods.rule_id
+                           ), 1)"""
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_alerts_version "
+                    "ON alert_periods(device_id, rule_id, rule_version, opened_at)"
+                )
+        # 旧事件没有记录命中的规则版本：accepted 事件按其归属的旧窗口回填；
+        # 隔离事件按事件时间落在当时生效的版本回填，保证修正/聚合不丢事件
+        if "events" in tables:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+            if "rule_id" in cols:
+                unbound = conn.execute(
+                    "SELECT COUNT(1) AS n FROM events WHERE rule_id IS NULL"
+                ).fetchone()["n"]
+                if unbound:
+                    conn.execute(
+                        """UPDATE events
+                           SET rule_id = (
+                                   SELECT w.rule_id FROM windows w
+                                   WHERE w.device_id = events.device_id
+                                     AND w.metric = events.metric
+                                     AND w.window_start = events.window_start
+                               ),
+                               rule_version = (
+                                   SELECT w.rule_version FROM windows w
+                                   WHERE w.device_id = events.device_id
+                                     AND w.metric = events.metric
+                                     AND w.window_start = events.window_start
+                               )
+                           WHERE rule_id IS NULL AND status = 'accepted'"""
+                    )
+                    conn.execute(
+                        """UPDATE events
+                           SET rule_id = (
+                                   SELECT r.rule_id FROM rules r
+                                   WHERE r.group_id = (
+                                           SELECT d.group_id FROM devices d
+                                           WHERE d.device_id = events.device_id
+                                       )
+                                     AND r.metric = events.metric
+                                     AND r.effective_from <= events.event_time
+                                     AND (r.effective_to IS NULL
+                                          OR r.effective_to > events.event_time)
+                                   ORDER BY r.version DESC LIMIT 1
+                               ),
+                               rule_version = (
+                                   SELECT r.version FROM rules r
+                                   WHERE r.group_id = (
+                                           SELECT d.group_id FROM devices d
+                                           WHERE d.device_id = events.device_id
+                                       )
+                                     AND r.metric = events.metric
+                                     AND r.effective_from <= events.event_time
+                                     AND (r.effective_to IS NULL
+                                          OR r.effective_to > events.event_time)
+                                   ORDER BY r.version DESC LIMIT 1
+                               )
+                           WHERE rule_id IS NULL AND status = 'quarantined'"""
+                    )
 
     @contextmanager
     def tx(self):

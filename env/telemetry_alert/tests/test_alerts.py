@@ -115,6 +115,49 @@ class TestAlerts(ServiceTestCase):
         self.assertEqual((w1["rule_version"], w1["hit"]), (1, 0))  # v1: 70>80 否
         self.assertEqual((w2["rule_version"], w2["hit"]), (2, 1))  # v2: 60>50 是
 
+    def test_overlapping_version_windows_alert_independently(self):
+        """版本在窗口中途生效、新旧窗口同起点并存时：两个版本各自独立
+        重放——连续命中不跨版本借用，同一起点可各开一个告警周期，
+        迟到修正只推翻它所绑定版本的周期。"""
+        rid = self.make_rule(threshold=80.0, consecutive_hits=2,
+                             recovery_count=3, allowed_lateness_sec=300)["rule_id"]
+        self.svc.register_device("d1", "g1")
+        # v1 窗口 [60,120) 只有一次命中，达不到 v1 的连续 2 次
+        self.ingest_ok(self.ev(value=90.0, t=70.0))
+        # v2 自 90 生效（窗口长度不变，v2 窗口也是 [60,120)），阈值 50、
+        # 连续 1 次即可开窗
+        self.svc.update_rule(rid, effective_from=90.0, threshold=50.0,
+                             consecutive_hits=1, recovery_count=3)
+        self.ingest_ok([
+            self.ev(value=60.0, t=100.0),
+            self.ev(value=60.0, t=190.0),    # v2 [180,240) 继续命中
+            self.ev(value=1.0, t=200.0),     # 推进水位线封存并存窗口
+        ])
+        alerts = self.alerts()
+        # v1 只有一次命中 -> 无 v1 周期；v2 一次命中 -> 一个 v2 周期，
+        # v2 没有借用 v1 的那次命中凑连续次数
+        self.assertEqual([(a["rule_version"], a["opened_at"]) for a in alerts],
+                         [(2, 60.0)])
+
+        # 再补一个 v1 命中窗口使 v1 也满足连续 2 次 -> v1 独立开周期
+        self.ingest_ok([
+            self.ev(value=95.0, t=5.0),       # 迟到修正 v1 [0,60)，命中
+            self.ev(value=1.0, t=260.0),
+        ])
+        alerts = {(a["rule_version"], a["opened_at"]): a
+                  for a in self.alerts()}
+        self.assertIn((1, 60.0), alerts)
+        self.assertIn((2, 60.0), alerts)
+        opened = [n for n in self.svc.list_notifications()
+                  if n["type"] == "opened"]
+        self.assertEqual(len(opened), 2)
+
+        # 迟到事件推翻 v1 [60,120)：只作废 v1 周期，v2 周期不受影响
+        self.ingest_ok(self.ev(value=1.0, t=75.0))
+        alerts = {a["rule_version"]: a for a in self.alerts()}
+        self.assertEqual(alerts[1]["status"], "invalidated")
+        self.assertEqual(alerts[2]["status"], "open")
+
     def test_alerts_isolated_per_device(self):
         self.boot(consecutive_hits=2)
         self.svc.register_device("d2", "g1")
