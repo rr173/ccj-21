@@ -1,0 +1,73 @@
+services:
+  # 核心：影子状态存储 + 版本规则 + 命令生成/确认（唯一写库者）
+  core:
+    build: .
+    command: ["python3", "run_core.py"]
+    environment:
+      CORE_HOST: 0.0.0.0
+      CORE_PORT: "8080"
+      SHADOW_DB_PATH: /data/shadow.db
+      SHADOW_INTERNAL_TOKEN: ${SHADOW_INTERNAL_TOKEN:-change-me-internal}
+      OFFLINE_AFTER_SECONDS: "${OFFLINE_AFTER_SECONDS:-30}"
+      PROLONGED_OFFLINE_SECONDS: "${PROLONGED_OFFLINE_SECONDS:-300}"
+      ACK_TIMEOUT_SECONDS: "${ACK_TIMEOUT_SECONDS:-30}"
+      COMMAND_TTL_SECONDS: "${COMMAND_TTL_SECONDS:-900}"
+      MAX_DELIVERY_ATTEMPTS: "${MAX_DELIVERY_ATTEMPTS:-5}"
+      RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-2}"
+      RETRY_BACKOFF_MAX: "${RETRY_BACKOFF_MAX:-60}"
+    volumes:
+      - shadow-data:/data
+    ports:
+      # 控制面 API。生产建议只在内网/反代后暴露
+      - "${CORE_PUBLISH_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else sys.exit(1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # 设备接入：无状态网关，可水平扩展
+  ingress:
+    build: .
+    command: ["python3", "run_ingress.py"]
+    depends_on:
+      core:
+        condition: service_healthy
+    environment:
+      INGRESS_HOST: 0.0.0.0
+      INGRESS_PORT: "8081"
+      CORE_URL: http://core:8080
+      SHADOW_INTERNAL_TOKEN: ${SHADOW_INTERNAL_TOKEN:-change-me-internal}
+      DEVICE_POLL_WAIT: "${DEVICE_POLL_WAIT:-25}"
+    ports:
+      - "${INGRESS_PUBLISH_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8081/healthz').status==200 else sys.exit(1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # 派发维护：TTL 过期、ACK 超时重试、离线扫描（无状态，可安全多副本）
+  dispatcher:
+    build: .
+    command: ["python3", "run_dispatcher.py"]
+    depends_on:
+      core:
+        condition: service_healthy
+    environment:
+      CORE_URL: http://core:8080
+      SHADOW_INTERNAL_TOKEN: ${SHADOW_INTERNAL_TOKEN:-change-me-internal}
+      DISPATCHER_POLL_INTERVAL: "${DISPATCHER_POLL_INTERVAL:-1}"
+      OFFLINE_AFTER_SECONDS: "${OFFLINE_AFTER_SECONDS:-30}"
+      PROLONGED_OFFLINE_SECONDS: "${PROLONGED_OFFLINE_SECONDS:-300}"
+      ACK_TIMEOUT_SECONDS: "${ACK_TIMEOUT_SECONDS:-30}"
+      COMMAND_TTL_SECONDS: "${COMMAND_TTL_SECONDS:-900}"
+      MAX_DELIVERY_ATTEMPTS: "${MAX_DELIVERY_ATTEMPTS:-5}"
+    restart: unless-stopped
+
+volumes:
+  shadow-data:
