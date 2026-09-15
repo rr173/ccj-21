@@ -61,6 +61,70 @@ def states_equal(a_json: str, b_json: str) -> bool:
     return canonical(a) == canonical(b)
 
 
+def flatten_state(obj: Any, prefix: str = "") -> dict[str, Any]:
+    """把 JSON 状态展开成可比较的叶子路径。
+
+    列表按位置作为路径的一部分；缺失字段和值变化都计入漂移。
+    """
+    out: dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for key in sorted(obj):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            out.update(flatten_state(obj[key], path))
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            out.update(flatten_state(value, f"{prefix}[{i}]"))
+    else:
+        out[prefix or "$"] = obj
+    return out
+
+
+def drift_ratio(target: Any, reported: Any) -> float:
+    """返回报告相对发布目标的叶子字段漂移比例（0 表示完全匹配）。"""
+    a = flatten_state(canonical(target))
+    b = flatten_state(canonical(reported))
+    paths = set(a) | set(b)
+    if not paths:
+        return 0.0
+    diff = sum(1 for path in paths if a.get(path) != b.get(path))
+    return diff / len(paths)
+
+
+def state_matches(target: Any, reported: Any, drift_threshold: float) -> bool:
+    """报告是否满足发布门禁；threshold 是允许的最大叶子漂移比例。"""
+    if canonical(target) == canonical(reported):
+        return True
+    return drift_threshold > 0 and drift_ratio(target, reported) <= drift_threshold
+
+
+def split_batches(device_ids: list[str], percent: float) -> list[list[str]]:
+    """按固定比例切分创建时锁定的设备快照。"""
+    if percent <= 0:
+        raise ValueError("batch_percent must be > 0")
+    ordered = sorted(device_ids)
+    total = len(ordered)
+    if total == 0:
+        return []
+    batches: list[list[str]] = []
+    taken = 0
+    while taken < total:
+        if percent >= 100 or not batches:
+            size = max(1, round(total * min(percent, 100.0) / 100.0)) if percent < 100 else total
+        else:
+            size = round(total * min(percent, 100.0) / 100.0)
+        size = min(size, total - taken)
+        # 最后一批兜底；极小设备数/比例下每批至少一台。
+        if not batches and percent < 100:
+            size = max(1, size)
+        if size <= 0:
+            size = 1
+        batches.append(ordered[taken:taken + size])
+        taken += size
+        if percent >= 100:
+            break
+    return batches
+
+
 def next_backoff_delay(attempt_no: int,
                        base: float = config.RETRY_BACKOFF_BASE,
                        cap: float = config.RETRY_BACKOFF_MAX) -> float:

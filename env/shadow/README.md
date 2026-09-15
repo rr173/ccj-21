@@ -99,6 +99,13 @@ QUEUED/RETRYING/SENT 超过 expires_at ─▶ EXPIRED（终态）
 | PUT | `/v1/devices/{id}/desired` | `{state, expected_version?, idempotency_key?}` |
 | GET | `/v1/devices/{id}/commands` | 该设备命令（版本倒序） |
 | GET | `/v1/commands/{cmdId}/attempts` | 每次派发尝试 |
+| POST/GET | `/v1/groups` | 创建设备组 / 查询组列表 |
+| POST/GET | `/v1/releases` | 创建分批发布 / 发布列表 |
+| GET | `/v1/releases/{id}` | 发布状态、门禁、批次和冲突汇总 |
+| GET | `/v1/releases/{id}/devices` | 批次逐设备明细（可按批次/状态过滤） |
+| GET | `/v1/releases/{id}/conflicts` | 发布冲突关系 |
+| GET | `/v1/releases/{id}/events` | 发布完整事件时间线 |
+| POST | `/v1/releases/{id}/{pause,continue,skip-failed,rollback}` | 幂等管理操作 |
 | GET | `/v1/events?device_id=&limit=&offset=` | 审计事件 |
 
 `GET /v1/devices/{id}` 关键字段：
@@ -129,6 +136,76 @@ QUEUED/RETRYING/SENT 超过 expires_at ─▶ EXPIRED（终态）
 | POST | `/devices/commands/poll` | `{}` long-poll，心跳 + 领下一条命令 |
 | POST | `/devices/ack` | `{command_id}` 或 `{version}`，`code/message` 可选 |
 | POST | `/devices/reported` | `{version, state}`，旧版本返回 409 |
+
+## 分批发布（设备组）
+
+面向设备组创建发布时会同时固化两份快照：
+
+* **目标状态快照**：本次发布的 `target_state`，后续再修改发布参数不会影响它。
+* **设备快照**：创建时该组的全部设备及每台设备的回滚基线 `(baseline_version, baseline_state)`。
+
+发布按 `batch_percent` 切分设备，按 `device_groups.priority`（数字越小优先级越高）
+和 `releases.created_at` 调度。多个发布命中同一台设备时，未启动的发布保持
+`PENDING`，读模型和 `/conflicts` 明确返回被哪个发布/设备阻塞。
+
+### 门禁与自动暂停
+
+当前批次中的设备先生成新的逐设备期望版本和命令。设备必须：
+
+1. ACK 成功（`OK/APPLIED/ACCEPTED/SUCCESS`，拒绝码立即失败）；
+2. ACK 之后上报与目标匹配的报告内容；
+3. 匹配率在 `batch_deadline_seconds` 前达到 `confirm_threshold`。
+
+匹配按规范化 JSON 内容判断；`drift_threshold` 允许少量叶子字段漂移，超过阈值
+自动暂停。设备拒绝、派发失败/命令过期，或批次超时也会自动暂停。暂停期间不会
+继续启动后续批次；重启后从数据库中的原批次恢复，重复 tick 不重复推进。
+
+达到确认率后进入下一批；仍在途的尾部设备保留命令和设备锁，直到匹配、被管理员
+跳过，或触发失败门禁。
+
+### 管理操作
+
+| 操作 | 语义 |
+|---|---|
+| `POST /v1/releases/{id}/pause` | 手动暂停；重复调用幂等 |
+| `POST /v1/releases/{id}/continue` | 从当前批次继续；失败设备生成**新的逐设备命令版本** |
+| `POST /v1/releases/{id}/skip-failed` | 只把拒绝/失败/过期/漂移设备标为 SKIPPED；重复调用幂等 |
+| `POST /v1/releases/{id}/rollback` | 对已进入发布且未跳过的设备，按基线生成新回滚命令版本 |
+
+继续和回滚都只追加新的 desired version/command，从不修改或覆盖历史命令。
+所有动作支持 `idempotency_key`；服务重启或客户端重试不会重复创建版本、重复推进
+或重复回滚。
+
+### 发布 API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST/GET | `/v1/groups` | 创建设备组（`priority/device_ids`）/列表 |
+| GET | `/v1/groups/{id}` | 组详情和当前成员 |
+| POST/GET | `/v1/releases` | 创建发布/列表 |
+| GET | `/v1/releases/{id}` | 发布状态、批次统计、当前门禁、冲突 |
+| GET | `/v1/releases/{id}/devices?batch_no=&status=` | 每批设备明细 |
+| GET | `/v1/releases/{id}/conflicts` | 双向冲突/阻塞关系 |
+| GET | `/v1/releases/{id}/events` | 完整发布事件时间线（含命令事件） |
+| POST | `/v1/releases/{id}/pause` | 暂停 |
+| POST | `/v1/releases/{id}/continue` | 继续 |
+| POST | `/v1/releases/{id}/skip-failed` | 跳过失败设备 |
+| POST | `/v1/releases/{id}/rollback` | 按设备快照回滚 |
+
+创建示例：
+
+```json
+POST /v1/releases
+{
+  "group_id": "canary",
+  "target_state": {"firmware": "2.4.0", "config": {"retries": 3}},
+  "batch_percent": 20,
+  "confirm_threshold": 100,
+  "drift_threshold": 0,
+  "batch_deadline_seconds": 600,
+  "idempotency_key": "release-20260915-01"
+}
+```
 
 ## Docker 部署
 
@@ -170,8 +247,9 @@ python3 run_sim.py --ingress-url http://localhost:8081 \
                               # noack    不确认（ACK 超时重发）
 
 # 测试
-python3 tests/test_model.py   # 纯逻辑：分类/退避/JSON 比较
+python3 tests/test_model.py   # 纯逻辑：分类/退避/JSON 比较/漂移比例/分批
 python3 tests/test_store.py   # SQLite 状态机（虚拟时钟，含重启恢复）
+python3 tests/test_releases.py # 分批发布、冲突门禁、暂停/跳过/继续/回滚
 python3 tests/e2e_test.py     # 真实三进程 HTTP 端到端
 ```
 

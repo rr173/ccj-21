@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Optional
 
 from . import config, model
+from .release_store import ReleaseStoreMixin
 from .schema import SCHEMA
 
 
@@ -28,7 +29,7 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
 
-class Store:
+class Store(ReleaseStoreMixin):
     def __init__(self, db_path: str = config.DB_PATH, clock=_now):
         self.db_path = db_path
         self.clock = clock
@@ -40,6 +41,25 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """为旧版 SQLite 数据库补齐后加字段（新建库无需 ALTER）。"""
+        columns = {
+            r["name"] for r in
+            self._conn.execute("PRAGMA table_info(commands)")}
+        if "release_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE commands ADD COLUMN release_id TEXT")
+        if "release_phase" not in columns:
+            self._conn.execute(
+                "ALTER TABLE commands ADD COLUMN release_phase TEXT"
+                " NOT NULL DEFAULT ''")
+        event_columns = {
+            r["name"] for r in
+            self._conn.execute("PRAGMA table_info(events)")}
+        if "release_id" not in event_columns:
+            self._conn.execute("ALTER TABLE events ADD COLUMN release_id TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -47,12 +67,13 @@ class Store:
     # ---------------- 通用 ----------------
     def event(self, device_id: Optional[str], event_type: str,
               detail: Optional[dict] = None, command_id: Optional[str] = None,
-              at: Optional[float] = None) -> None:
+              at: Optional[float] = None,
+              release_id: Optional[str] = None) -> None:
         self._conn.execute(
-            "INSERT INTO events(at, device_id, command_id, event_type, detail)"
-            " VALUES(?,?,?,?,?)",
-            (at or self.clock(), device_id, command_id, event_type,
-             _json(detail or {})))
+            "INSERT INTO events(at, device_id, command_id, release_id,"
+            " event_type, detail) VALUES(?,?,?,?,?,?)",
+            (at or self.clock(), device_id, command_id, release_id,
+             event_type, _json(detail or {})))
 
     def _row(self, sql: str, args=()):
         return self._conn.execute(sql, args).fetchone()
@@ -154,6 +175,50 @@ class Store:
         return results
 
     # ---------------- 期望态 ----------------
+    def _enqueue_desired_unlocked(self, device_id: str, desired: dict,
+                                  now: float, release_id: Optional[str] = None,
+                                  phase: str = "") -> dict:
+        """生成新的设备期望版本和逐设备命令；不改写任何历史命令。"""
+        cur_ver = self._row(
+            "SELECT desired_version FROM shadows WHERE device_id=?",
+            (device_id,))["desired_version"]
+        new_ver = cur_ver + 1
+        cmd_id = new_id("cmd")
+        expires_at = now + config.COMMAND_TTL_SECONDS
+        self._conn.execute(
+            "UPDATE shadows SET desired=?, desired_version=?,"
+            " desired_updated_at=? WHERE device_id=?",
+            (_json(desired), new_ver, now, device_id))
+        self._conn.execute(
+            "INSERT INTO commands(id,device_id,version,desired,status,"
+            "created_at,expires_at,release_id,release_phase)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (cmd_id, device_id, new_ver, _json(desired),
+             config.ST_QUEUED, now, expires_at, release_id, phase))
+        old = self._all(
+            "SELECT id, version FROM commands WHERE device_id=?"
+            " AND version < ? AND status IN (?,?)",
+            (device_id, new_ver, config.ST_QUEUED, config.ST_RETRYING))
+        for r in old:
+            self._conn.execute(
+                "UPDATE commands SET status=? WHERE id=?",
+                (config.ST_SUPERSEDED, r["id"]))
+            self.event(device_id, "COMMAND_SUPERSEDED",
+                       {"command_id": r["id"], "version": r["version"],
+                        "superseded_by_version": new_ver,
+                        "release_id": release_id},
+                       command_id=r["id"], at=now, release_id=release_id)
+        self.event(device_id, "DESIRED_UPDATED",
+                   {"version": new_ver, "desired": desired,
+                    "release_id": release_id, "phase": phase},
+                   at=now, release_id=release_id)
+        self.event(device_id, "COMMAND_ENQUEUED",
+                   {"command_id": cmd_id, "version": new_ver,
+                    "expires_at": expires_at, "release_id": release_id,
+                    "phase": phase},
+                   command_id=cmd_id, at=now, release_id=release_id)
+        return {"id": cmd_id, "version": new_ver, "expires_at": expires_at}
+
     def set_desired(self, device_id: str, desired: dict,
                     expected_version: Optional[int] = None,
                     idem_key: Optional[str] = None) -> dict:
@@ -184,38 +249,12 @@ class Store:
                         "expected_version": expected_version}
 
             new_ver = cur_ver + 1
-            cmd_id = new_id("cmd")
-            expires_at = now + config.COMMAND_TTL_SECONDS
             with self._conn:  # 单一事务
-                self._conn.execute(
-                    "UPDATE shadows SET desired=?, desired_version=?,"
-                    " desired_updated_at=? WHERE device_id=?",
-                    (_json(desired), new_ver, now, device_id))
-                self._conn.execute(
-                    "INSERT INTO commands(id,device_id,version,desired,"
-                    "status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-                    (cmd_id, device_id, new_ver, _json(desired),
-                     config.ST_QUEUED, now, expires_at))
-                # 取代从未送达的旧命令（排除刚插入的当前版本）
-                old = self._all(
-                    "SELECT id, version FROM commands WHERE device_id=?"
-                    " AND version < ? AND status IN (?,?)",
-                    (device_id, new_ver,
-                     config.ST_QUEUED, config.ST_RETRYING))
-                for r in old:
-                    self._conn.execute(
-                        "UPDATE commands SET status=? WHERE id=?",
-                        (config.ST_SUPERSEDED, r["id"]))
-                    self.event(device_id, "COMMAND_SUPERSEDED",
-                               {"command_id": r["id"], "version": r["version"],
-                                "superseded_by_version": new_ver},
-                               command_id=r["id"], at=now)
-                self.event(device_id, "DESIRED_UPDATED",
-                           {"version": new_ver, "desired": desired}, at=now)
-                self.event(device_id, "COMMAND_ENQUEUED",
-                           {"command_id": cmd_id, "version": new_ver,
-                            "expires_at": expires_at},
-                           command_id=cmd_id, at=now)
+                enq = self._enqueue_desired_unlocked(
+                    device_id, desired, now)
+            cmd_id = enq["id"]
+            new_ver = enq["version"]
+            expires_at = enq["expires_at"]
 
             online = bool(self._row(
                 "SELECT online FROM shadows WHERE device_id=?",
@@ -248,6 +287,7 @@ class Store:
             if row is None:
                 raise KeyError(f"device not found: {device_id}")
             cur_ver = row["reported_version"]
+            active_release = self.active_release_for_device(device_id)
             if version <= cur_ver:
                 detail = {"received_version": version,
                           "current_version": cur_ver,
@@ -263,7 +303,10 @@ class Store:
                     " reported_updated_at=? WHERE device_id=?",
                     (_json(state), version, now, device_id))
                 self.event(device_id, "REPORT_ACCEPTED",
-                           {"version": version, "state": state}, at=now)
+                           {"version": version, "state": state}, at=now,
+                           release_id=active_release["id"]
+                           if active_release else None)
+                self.report_release_progress(device_id, now)
             return {"accepted": True, "version": version}
 
     # ---------------- 命令派发 ----------------
@@ -298,6 +341,25 @@ class Store:
                 " ORDER BY version ASC",
                 (device_id, config.ST_QUEUED, config.ST_RETRYING,
                  config.ST_SENT))
+            dispatchable = []
+            active_release = self.holding_release_for_device(device_id)
+            for r in rows:
+                if r["release_id"]:
+                    item = self._row(
+                        "SELECT status FROM release_devices"
+                        " WHERE release_id=? AND device_id=?",
+                        (r["release_id"], device_id))
+                    if item is None:
+                        continue
+                    expected = (config.RD_ROLLBACK_ACTIVE
+                                if r["release_phase"] == "ROLLBACK"
+                                else config.RD_ACTIVE)
+                    if item["status"] == expected:
+                        dispatchable.append(r)
+                elif active_release is None:
+                    # 设备正被发布批次占有时，普通控制命令等待发布锁释放。
+                    dispatchable.append(r)
+            rows = dispatchable
             # 最低版本若已 SENT（在途），整体不可派发；若是 RETRYING 未到
             # 退避时间，也必须继续等待。
             cand = None
@@ -360,8 +422,12 @@ class Store:
             self.event(cmd["device_id"], "COMMAND_ACKED",
                        {"command_id": command_id, "version": cmd["version"],
                         "code": code, "message": message,
-                        "duplicate": False},
-                       command_id=command_id, at=now)
+                        "duplicate": False,
+                        "release_id": cmd["release_id"],
+                        "phase": cmd["release_phase"]},
+                       command_id=command_id, at=now,
+                       release_id=cmd["release_id"])
+            self._refresh_release_for_command_unlocked(cmd, now)
         return {"status": "ACKED", "command_id": command_id,
                 "version": cmd["version"], "duplicate": False}
 
@@ -414,8 +480,12 @@ class Store:
                     self.event(cmd["device_id"], "COMMAND_FAILED",
                               {"command_id": command_id,
                                "version": cmd["version"], "error": error,
-                               "attempts": attempts, "reason": reason},
-                              command_id=command_id, at=now)
+                               "attempts": attempts, "reason": reason,
+                               "release_id": cmd["release_id"],
+                               "phase": cmd["release_phase"]},
+                              command_id=command_id, at=now,
+                              release_id=cmd["release_id"])
+                    self._refresh_release_for_command_unlocked(cmd, now)
                     return {"status": new_status, "command_id": command_id,
                             "retry": False, "reason": reason}
                 self._conn.execute(
@@ -444,8 +514,12 @@ class Store:
                 (now, cmd["id"]))
             self.event(cmd["device_id"], "COMMAND_EXPIRED",
                        {"command_id": cmd["id"], "version": cmd["version"],
-                        "expires_at": cmd["expires_at"]},
-                       command_id=cmd["id"], at=now)
+                        "expires_at": cmd["expires_at"],
+                        "release_id": cmd["release_id"],
+                        "phase": cmd["release_phase"]},
+                       command_id=cmd["id"], at=now,
+                       release_id=cmd["release_id"])
+            self._refresh_release_for_command_unlocked(cmd, now)
 
     def _expire_unlocked(self, device_id: Optional[str], now: float) -> int:
         args: list[Any] = [now]
@@ -501,7 +575,9 @@ class Store:
             now = self.clock()
             expired = self._expire_unlocked(None, now)
             timeouts = self._ack_timeout_unlocked(None, now)
-        return {"at": now, "expired": expired, "ack_timeouts": timeouts}
+            release_result = self._tick_releases_unlocked(now)
+        return {"at": now, "expired": expired,
+                "ack_timeouts": timeouts, "releases": release_result}
 
     # ---------------- 查询读模型 ----------------
     def shadow_read_model(self, device_id: str) -> Optional[dict]:

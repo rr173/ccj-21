@@ -6,6 +6,8 @@
 - command_attempts             每次派发尝试（失败重试的完整轨迹）
 - events                       审计事件流（重启不丢、全程可追溯）
 - idempotent_requests          控制端幂等键去重
+- device_groups / group_members 设备组及发布时锁定的成员关系
+- releases / release_batches / release_devices 分批发布、批次门禁和设备明细
 """
 from __future__ import annotations
 
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS commands (
     last_error      TEXT NOT NULL DEFAULT '',
     ack_code        TEXT NOT NULL DEFAULT '',
     ack_message     TEXT NOT NULL DEFAULT '',
+    release_id      TEXT,
+    release_phase   TEXT NOT NULL DEFAULT '',           -- FORWARD/ROLLBACK
     UNIQUE(device_id, version)
 );
 
@@ -70,6 +74,96 @@ CREATE TABLE IF NOT EXISTS command_attempts (
     error       TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS device_groups (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    priority     INTEGER NOT NULL DEFAULT 100,  -- 数字越小优先级越高
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id     TEXT NOT NULL REFERENCES device_groups(id),
+    device_id    TEXT NOT NULL REFERENCES devices(id),
+    added_at     REAL NOT NULL,
+    PRIMARY KEY(group_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_members_device
+    ON group_members(device_id);
+
+CREATE TABLE IF NOT EXISTS releases (
+    id                    TEXT PRIMARY KEY,
+    group_id              TEXT NOT NULL REFERENCES device_groups(id),
+    target_state          TEXT NOT NULL,
+    batch_percent         REAL NOT NULL,
+    confirm_threshold     REAL NOT NULL,
+    drift_threshold       REAL NOT NULL DEFAULT 0,
+    batch_deadline_seconds REAL NOT NULL,
+    status                TEXT NOT NULL,
+    -- PENDING/ACTIVE/PAUSED/COMPLETED/ROLLING_BACK/ROLLED_BACK/CANCELLED
+    current_batch         INTEGER NOT NULL DEFAULT 0,
+    gate_reason           TEXT NOT NULL DEFAULT 'WAITING_CONFLICT',
+    pause_reason          TEXT NOT NULL DEFAULT '',
+    phase                 TEXT NOT NULL DEFAULT 'FORWARD',
+    created_at            REAL NOT NULL,
+    created_by            TEXT NOT NULL DEFAULT '',
+    started_at            REAL,
+    paused_at             REAL,
+    completed_at          REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_releases_scheduling
+    ON releases(status, created_at);
+
+CREATE TABLE IF NOT EXISTS release_devices (
+    release_id       TEXT NOT NULL REFERENCES releases(id),
+    device_id        TEXT NOT NULL REFERENCES devices(id),
+    batch_no         INTEGER NOT NULL,
+    ordinal          INTEGER NOT NULL,
+    baseline_version INTEGER NOT NULL,
+    baseline_state   TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    -- WAITING/ACTIVE/MATCHED/SKIPPED/REJECTED/FAILED/EXPIRED/DRIFT/
+    -- ROLLBACK_ACTIVE/ROLLED_BACK/ROLLBACK_FAILED
+    forward_command_id TEXT,
+    rollback_command_id TEXT,
+    last_error       TEXT NOT NULL DEFAULT '',
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY(release_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_devices_device
+    ON release_devices(device_id, status);
+CREATE INDEX IF NOT EXISTS idx_release_devices_batch
+    ON release_devices(release_id, batch_no, status);
+
+CREATE TABLE IF NOT EXISTS release_batches (
+    release_id       TEXT NOT NULL REFERENCES releases(id),
+    batch_no         INTEGER NOT NULL,
+    status           TEXT NOT NULL,
+    -- WAITING/ACTIVE/GATED/COMPLETED/SKIPPED
+    device_count     INTEGER NOT NULL,
+    started_at       REAL,
+    deadline_at      REAL,
+    finished_at      REAL,
+    gate_reason      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(release_id, batch_no)
+);
+
+CREATE TABLE IF NOT EXISTS release_operations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_id      TEXT NOT NULL REFERENCES releases(id),
+    operation       TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    status          TEXT NOT NULL,
+    detail          TEXT NOT NULL DEFAULT '{}',
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_ops
+    ON release_operations(release_id, id);
+
 CREATE TABLE IF NOT EXISTS idempotent_requests (
     idem_key    TEXT PRIMARY KEY,
     response    TEXT NOT NULL,
@@ -81,6 +175,7 @@ CREATE TABLE IF NOT EXISTS events (
     at          REAL NOT NULL,
     device_id   TEXT,
     command_id  TEXT,
+    release_id  TEXT,
     event_type  TEXT NOT NULL,
     detail      TEXT NOT NULL DEFAULT '{}'
 );

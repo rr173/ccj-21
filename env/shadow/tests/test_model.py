@@ -5,7 +5,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import config
-from app.model import classify, next_backoff_delay, states_equal, canonical
+from app.model import (classify, drift_ratio, next_backoff_delay,
+                       split_batches, state_matches, states_equal, canonical)
 
 
 def test_states_equal_ignores_key_order_and_whitespace():
@@ -73,8 +74,20 @@ def test_backoff_exponential_capped():
     print("ok: backoff")
 
 
+def test_release_batching_and_drift():
+    batches = split_batches(["a", "b", "c", "d", "e"], 40)
+    assert batches == [["a", "b"], ["c", "d"], ["e"]]
+    assert split_batches(["a"], 10) == [["a"]]
+    target = {"a": 1, "b": {"c": 2, "d": 3}}
+    assert drift_ratio(target, {"a": 1, "b": {"c": 2, "d": 9}}) == 1 / 3
+    assert state_matches(target, {"a": 1, "b": {"c": 2, "d": 9}}, 0.34)
+    assert not state_matches(target, {"a": 1, "b": {"c": 2, "d": 9}}, 0.3)
+    print("ok: release batches and drift threshold")
+
+
 if __name__ == "__main__":
     test_states_equal_ignores_key_order_and_whitespace()
     test_classify_reasons()
     test_backoff_exponential_capped()
+    test_release_batching_and_drift()
     print("ALL MODEL TESTS PASSED")
