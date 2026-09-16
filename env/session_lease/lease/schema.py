@@ -87,8 +87,10 @@ CREATE TABLE IF NOT EXISTS takeovers (
 CREATE INDEX IF NOT EXISTS ix_takeovers_device ON takeovers(device_id, created_at);
 
 -- 命令：设备内版本单调；每条命令的当前派发代次记录在案
--- QUEUED -> SENT -> ACKED（终态）；会话失效时 SENT -> RECONCILING，
+-- QUEUED -> SENT -> ACKED（终态）；会话失效时只有 SENT -> RECONCILING，
+-- 从未发送的 QUEUED 原样保留由新通道直接领取。
 -- 对账判定设备已执行 -> ACKED(RECONCILE_DONE)，未执行 -> 回到 QUEUED 重投
+-- QUEUED_UNKNOWN 为旧版本遗留状态，新代码不再产生，Store 启动时迁移回 QUEUED
 CREATE TABLE IF NOT EXISTS commands (
     command_id                   TEXT PRIMARY KEY,
     device_id                    TEXT NOT NULL,

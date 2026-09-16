@@ -80,19 +80,16 @@ class RestartTests(LeaseTestCase):
         cmds = {c["version"]: c for c in self.db.list_commands("dev1")}
         self.assertEqual(cmds[c1["version"]]["state"],
                          config.CMD_RECONCILING)
-        self.assertEqual(cmds[c2["version"]]["state"],
-                         config.CMD_QUEUED_UNKNOWN)
+        # 从未发送的命令不冻结：切换后仍 QUEUED，新通道直接领取
+        self.assertEqual(cmds[c2["version"]]["state"], config.CMD_QUEUED)
         # 接管记录恢复为已完成
         tk = self.db.list_takeovers("dev1")[0]
         self.assertEqual(tk["state"], config.TK_COMPLETED)
-        # 对账在重启后仍可完成；c2 未执行 -> 回 QUEUED
+        # 只对已下达、结果未知的 c1 对账（已执行）；c2 无需核实
         r = self.db.reconcile("dev1", "c2", 1, self._secret("dev1", 1), [
             {"version": c1["version"], "done": True},
-            {"version": c2["version"], "done": False},
         ])
-        outcomes = {x["version"]: x["outcome"] for x in r["results"]}
-        self.assertEqual(outcomes[c1["version"]], "RECONCILE_DONE")
-        self.assertEqual(outcomes[c2["version"]], "RETRY_TO_NEW_SESSION")
+        self.assertEqual(r["results"][0]["outcome"], "RECONCILE_DONE")
         p = self.db.poll("dev1", "c2", 1, self._secret("dev1", 1))
         self.assertEqual(p["command"]["version"], c2["version"])
 

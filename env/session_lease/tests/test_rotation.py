@@ -95,12 +95,12 @@ class RotationTests(LeaseTestCase):
             self.db.report_state("dev1", "c1", 1,
                                  self._secret("dev1", 1), 1, {"a": 1})
         self.assert_rejected(ctx, "CREDENTIAL_REVOKED")
-        # 命令不丢：在途转对账，未发送转 QUEUED_UNKNOWN 等新会话表态
+        # 命令不丢：在途转对账，未发送的原样留队由新通道直接领取
         cmds = {c["version"]: c for c in self.db.list_commands("dev1")}
         self.assertEqual(cmds[cmd["version"]]["state"],
                          config.CMD_RECONCILING)
         self.assertEqual(cmds[queued["version"]]["state"],
-                         config.CMD_QUEUED_UNKNOWN)
+                         config.CMD_QUEUED)
         rots = self.db.list_rotations("dev1")
         self.assertEqual(rots[0]["state"], config.ROT_OLD_REVOKED)
 

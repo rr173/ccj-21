@@ -7,8 +7,9 @@
 * 旧会话（非当前代次、或已结束）的状态上报、命令确认、续期一律拒绝并落
   rejected_messages，绝不覆盖新会话产生的状态。
 * 命令 SENT 绑定派发代次；会话结束（被接管/租约过期/凭证撤销）时，
-  已确认的不动、未发送（QUEUED）原样留给新会话、在途（SENT）转 RECONCILING，
-  必须由新会话按命令版本对账后才能 ACKED 或回 QUEUED 重投。
+  已确认的不动、从未发送（QUEUED）的原样留在队列等新通道直接领取、
+  在途（SENT）转 RECONCILING，必须由新会话按命令版本对账后才能 ACKED
+  或回 QUEUED 重投。
 * 轮换期间旧凭证 ROTATING 只允许给它自己的现存会话续期；新连接必须用 ACTIVE
   新凭证。宽限期到期或管理员撤销后旧会话 REVOKED/失效，但命令不丢。
 """
@@ -77,6 +78,23 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(SCHEMA)
+        self._migrate_queued_unknown()
+
+    def _migrate_queued_unknown(self) -> None:
+        """旧版本曾把从未发送的命令冻结为 QUEUED_UNKNOWN 等待对账；
+        这些命令从未下达、设备不可能执行过，恢复为 QUEUED 由当前通道直接领取。"""
+        rows = self._all(
+            "SELECT * FROM commands WHERE state=?",
+            (config.CMD_QUEUED_UNKNOWN,))
+        now = self.clock()
+        for cmd in rows:
+            self._conn.execute(
+                "UPDATE commands SET state=? WHERE command_id=?",
+                (config.CMD_QUEUED, cmd["command_id"]))
+            self.command_event(
+                cmd["command_id"], cmd["device_id"], "RELEASED_TO_QUEUE",
+                detail={"from_state": config.CMD_QUEUED_UNKNOWN,
+                        "reason": "NEVER_DISPATCHED"}, at=now)
 
     def close(self) -> None:
         self._conn.close()
@@ -235,9 +253,9 @@ class Store:
             " superseded_by_session_id=COALESCE(?, superseded_by_session_id)"
             " WHERE session_id=?",
             (state, at, reason, new_session_id, session_row["session_id"]))
-        # 在途（SENT，结果未知）命令转对账；已 ACKED 的绝不重发；
-        # 从未发送（QUEUED）的转 QUEUED_UNKNOWN 等新会话对账表态，
-        # 不直接重投（设备可能已经在本地执行过）。
+        # 在途（SENT，结果未知）命令转对账；已 ACKED 的绝不重发。
+        # 从未发送（QUEUED）的命令设备不可能执行过：原样留在队列，
+        # 由接管后的新通道直接领取，绝不要求对账核实。
         sent = self._all(
             "SELECT * FROM commands WHERE device_id=? AND state=?",
             (session_row["device_id"], config.CMD_SENT))
@@ -254,17 +272,9 @@ class Store:
                 session_id=last_attempt["session_id"] if last_attempt else None,
                 detail={"reason": reason,
                         "lost_generation": cmd["dispatch_generation"]}, at=at)
-        unsent = self._all(
-            "SELECT * FROM commands WHERE device_id=? AND state=?",
-            (session_row["device_id"], config.CMD_QUEUED))
-        for cmd in unsent:
-            self._conn.execute(
-                "UPDATE commands SET state=? WHERE command_id=?",
-                (config.CMD_QUEUED_UNKNOWN, cmd["command_id"]))
-            self.command_event(
-                cmd["command_id"], cmd["device_id"], "HELD_PENDING_RECONCILE",
-                session_id=session_row["session_id"],
-                detail={"reason": reason}, at=at)
+        retained_queued = self._row(
+            "SELECT COUNT(*) AS n FROM commands WHERE device_id=? AND state=?",
+            (session_row["device_id"], config.CMD_QUEUED))["n"]
         # 清掉设备的当前可写会话指针（若指向它）
         self._conn.execute(
             "UPDATE devices SET current_session_id=NULL"
@@ -274,7 +284,9 @@ class Store:
                    session_row["session_id"],
                    detail={"generation": session_row["generation"],
                            "reason": reason,
-                           "reconciling_commands": len(sent)}, at=at)
+                           "reconciling_commands": len(sent),
+                           "queued_commands_retained": retained_queued},
+                   at=at)
 
     def _expire_if_due(self, session_row, now: float):
         """租约已到期则按 EXPIRED 结束并返回新 row（None）。"""
@@ -298,9 +310,6 @@ class Store:
             fp_obj = {"device_id": device_id, "connection_no": connection_no,
                       "credential_version": cred_version,
                       "lease_seconds": lease_seconds}
-            replay = self._idem_guard(config.IDEM_ONLINE, idem_key, fp_obj)
-            if replay:
-                return replay
 
             device = self._device(device_id)
             cred = self._check_credential(device_id, cred_version, secret)
@@ -321,7 +330,9 @@ class Store:
                     "轮换期间旧凭证只允许已有会话续期，新连接必须使用新凭证",
                     {"credential_version": cred_version})
 
-            # 同一连接编号：关闭过的永不复活；仍 ACTIVE 的视为重复上线
+            # 同一连接编号：关闭过的永不复活；仍 ACTIVE 的视为重复上线。
+            # 注意：活性检查必须先于幂等重放——已死连接拿着旧幂等键重放
+            # 同样要被拒绝，绝不能让旧通道借重放复活。
             existing = self._row(
                 "SELECT * FROM sessions WHERE device_id=? AND connection_no=?",
                 (device_id, connection_no))
@@ -347,11 +358,20 @@ class Store:
                                         "presented": cred_version}, at=now)
                     raise LeaseError(409, "CREDENTIAL_MISMATCH",
                                      "连接编号已绑定其它凭证版本")
+                # 活跃连接重复上线：先校验幂等键（冲突仍 409），再回放
+                replay = self._idem_guard(config.IDEM_ONLINE, idem_key, fp_obj)
+                if replay:
+                    return replay
                 resp = self._session_view(existing, duplicate=True)
                 if idem_key:
                     self._idem_put(config.IDEM_ONLINE, idem_key,
                                    _fingerprint(fp_obj), resp)
                 return resp
+
+            # 新连接：先做幂等校验（同键不同体直接冲突，绝不顶掉旧会话）
+            replay = self._idem_guard(config.IDEM_ONLINE, idem_key, fp_obj)
+            if replay:
+                return replay
 
             lease = _clamp_lease(lease_seconds)
 
@@ -525,9 +545,6 @@ class Store:
             fp_obj = {"device_id": device_id, "connection_no": connection_no,
                       "credential_version": cred_version,
                       "lease_seconds": lease_seconds}
-            replay = self._idem_guard(config.IDEM_RENEW, idem_key, fp_obj)
-            if replay:
-                return replay
 
             device = self._device(device_id)
             session = self._row(
@@ -574,6 +591,10 @@ class Store:
                 raise LeaseError(410, "SESSION_EXPIRED",
                                  "租约已到期，不能续期；请重新上线")
             # ROTATING 旧凭证：明确允许续它自己的现存会话（唯一放行的旧凭证操作）
+            # 鉴权全部通过后才允许幂等重放：失效会话的旧重放必须先被拦截落痕。
+            replay = self._idem_guard(config.IDEM_RENEW, idem_key, fp_obj)
+            if replay:
+                return replay
             lease = _clamp_lease(lease_seconds)
             new_expiry = now + lease
             self._conn.execute(
@@ -612,24 +633,23 @@ class Store:
                 (now + lease, now, session["session_id"]))
 
             # 严格按命令版本顺序处理：最低版本未决命令决定 poll 返回什么。
+            # 从未发送（QUEUED）的命令在会话切换时原样保留，新通道直接领取，
+            # 不需要对账冻结；只有已下达、结果未知的 RECONCILING 才阻塞补发。
             lowest = self._row(
-                "SELECT * FROM commands WHERE device_id=? AND state IN (?,?,?,?)"
+                "SELECT * FROM commands WHERE device_id=? AND state IN (?,?,?)"
                 " ORDER BY version ASC LIMIT 1",
                 (device_id, config.CMD_QUEUED, config.CMD_SENT,
-                 config.CMD_RECONCILING, config.CMD_QUEUED_UNKNOWN))
+                 config.CMD_RECONCILING))
             queued = lowest if lowest is not None and \
                 lowest["state"] == config.CMD_QUEUED else None
             if lowest is not None and lowest["state"] in (
-                    config.CMD_SENT, config.CMD_RECONCILING,
-                    config.CMD_QUEUED_UNKNOWN):
+                    config.CMD_SENT, config.CMD_RECONCILING):
                 # 低版本结果未知：幂等重发在途命令/提示对账，绝不跳发新版本。
-                # QUEUED_UNKNOWN 不是派发（不产生 attempt），状态保持不变。
                 return {"command": self._command_view(lowest),
                         "duplicate_dispatch":
                         lowest["state"] == config.CMD_SENT,
-                        "await_reconcile": lowest["state"] in (
-                            config.CMD_RECONCILING,
-                            config.CMD_QUEUED_UNKNOWN),
+                        "await_reconcile":
+                        lowest["state"] == config.CMD_RECONCILING,
                         "session_generation": session["generation"],
                         "lease_expires_at": now + lease}
             if queued is not None:
@@ -688,11 +708,12 @@ class Store:
             fp_obj = {"device_id": device_id, "connection_no": connection_no,
                       "credential_version": cred_version,
                       "state_version": state_version, "state": state}
+            # 先鉴权：被顶替/过期/撤销的旧通道不能借幂等重放写入实况
+            device, session, _ = self._writable_session(
+                device_id, connection_no, cred_version, secret, "REPORT", now)
             replay = self._idem_guard(config.IDEM_REPORT, idem_key, fp_obj)
             if replay:
                 return replay
-            device, session, _ = self._writable_session(
-                device_id, connection_no, cred_version, secret, "REPORT", now)
 
             prev = self._row(
                 "SELECT * FROM reported_states WHERE device_id=?",
@@ -752,11 +773,12 @@ class Store:
                       "credential_version": cred_version,
                       "command_id": command_id, "version": version,
                       "code": code, "result": result}
+            # 先鉴权：旧通道不能拿先前 ACK 的幂等键重放成成功回执
+            device, session, _ = self._writable_session(
+                device_id, connection_no, cred_version, secret, "ACK", now)
             replay = self._idem_guard(config.IDEM_ACK, idem_key, fp_obj)
             if replay:
                 return replay
-            device, session, _ = self._writable_session(
-                device_id, connection_no, cred_version, secret, "ACK", now)
 
             cmd = self._find_command(device_id, command_id, version)
             if cmd["state"] == config.CMD_ACKED:
@@ -766,8 +788,7 @@ class Store:
                         "version": cmd["version"], "state": config.CMD_ACKED,
                         "duplicate_ack": True,
                         "session_generation": session["generation"]}
-            if cmd["state"] in (config.CMD_RECONCILING,
-                                config.CMD_QUEUED_UNKNOWN):
+            if cmd["state"] in config.CMD_AWAIT_RECONCILE_STATES:
                 self.reject("ACK", "COMMAND_AWAIT_RECONCILE", device_id,
                             session["session_id"], session["generation"],
                             connection_no,
@@ -851,12 +872,13 @@ class Store:
                 key=lambda e: e["version"])
             fp_obj = {"device_id": device_id, "connection_no": connection_no,
                       "credential_version": cred_version, "entries": norm}
-            replay = self._idem_guard(config.IDEM_RECONCILE, idem_key, fp_obj)
-            if replay:
-                return replay
+            # 先鉴权：旧通道不能借对账重放影响新通道的核实结果
             device, session, _ = self._writable_session(
                 device_id, connection_no, cred_version, secret,
                 "RECONCILE", now)
+            replay = self._idem_guard(config.IDEM_RECONCILE, idem_key, fp_obj)
+            if replay:
+                return replay
 
             results = []
             done_count = retry_count = 0
@@ -924,23 +946,8 @@ class Store:
             return {"version": ver, "command_id": cid,
                     "outcome": "STILL_QUEUED", "state": config.CMD_QUEUED}
         if cmd["state"] == config.CMD_QUEUED_UNKNOWN:
-            # 会话切换前从未发送给设备：设备对账表态
-            if entry["done"]:
-                # 设备声称未发送却已完成：保守视为完成（设备本地执行过）
-                self._conn.execute(
-                    "UPDATE commands SET state=?, acked_at=?, ack_code=?,"
-                    " ack_result=?, ack_source=? WHERE command_id=?",
-                    (config.CMD_ACKED, now,
-                     entry.get("result") or "RECONCILED_DONE",
-                     entry.get("result"), "RECONCILE_DONE", cid))
-                self.command_event(
-                    cid, cmd["device_id"], "RECONCILE_DONE",
-                    generation=session["generation"],
-                    session_id=session["session_id"],
-                    detail={"version": ver, "was_unsent": True,
-                            "result": entry.get("result")}, at=now)
-                return {"version": ver, "command_id": cid,
-                        "outcome": "RECONCILE_DONE", "state": config.CMD_ACKED}
+            # 遗留兜底：新版本不再产生 QUEUED_UNKNOWN（启动时已迁移回 QUEUED）。
+            # 若库里仍有该状态行，按「从未发送、未执行」处理：回队列直接重投。
             self._conn.execute(
                 "UPDATE commands SET state=? WHERE command_id=?",
                 (config.CMD_QUEUED, cid))

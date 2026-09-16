@@ -27,7 +27,9 @@
   EXPIRED / REVOKED 后再用同一编号上线，拒绝 `DEAD_CONNECTION_REUSED`。
 * **旧连接的消息一律拒绝且留痕**：被顶替、过期、撤销的会话提交状态上报、
   命令确认、续期、对账时，在鉴权阶段就被拒绝，原因写入 `rejected_messages`
-  （控制端可按设备/类型查询），**绝不覆盖新会话产生的状态**。
+  （控制端可按设备/类型查询），**绝不覆盖新会话产生的状态**。鉴权先于
+  幂等重放：旧连接带着先前成功请求的 `idempotency_key` 重发同样会被拦截，
+  不会回放成成功响应。
 * **租约持久化**：每次上线/续期/poll 心跳都把 `lease_expires_at` 落库；
   后台 sweep（或下一次消息）到点把会话置 EXPIRED。**到期之后的续期被拒绝**，
   只能重新上线拿新代次。
@@ -62,9 +64,9 @@ ACTIVE ──发起轮换──▶ ROTATING ──宽限期到期 / 管理员撤
                     ┌─ 设备 ACK ─▶ ACKED（终态，接管后绝不重发）
 QUEUED ─poll派发─▶ SENT
                     └─ 会话失效（接管/并发上线/租约过期/凭证撤销）
-                              ─▶ RECONCILING（结果未知，冻结）
+                              ─▶ RECONCILING（已下达、结果未知，冻结）
 
-QUEUED（从未发送）─ 会话失效 ─▶ QUEUED_UNKNOWN（冻结，等新会话对账表态）
+QUEUED（从未发送）─ 会话失效 ─▶ QUEUED（原样留队，新通道直接领取，不核实）
 ```
 
 接管 / 并发上线 / 租约到期 / 凭证撤销发生时：
@@ -72,8 +74,12 @@ QUEUED（从未发送）─ 会话失效 ─▶ QUEUED_UNKNOWN（冻结，等新
 | 切换前状态 | 处置 |
 |---|---|
 | ACKED（已确认） | 原封不动，**绝不重发** |
-| QUEUED（从未发送） | 转 `QUEUED_UNKNOWN`，等新会话按版本对账 |
+| QUEUED（从未发送） | **原样留在队列**：设备从未收到，不可能执行过，新通道 poll 直接领取 |
 | SENT（已发送，结果未知） | 转 `RECONCILING`，必须对账后才能决定 |
+
+> 只有**下达后缺少结果**的命令才需要核实；从未下达的任务绝不挂账待核实。
+> 旧版本曾把 QUEUED 冻结为 `QUEUED_UNKNOWN`，启动时自动迁移回 `QUEUED`
+> （命令时间线留 `RELEASED_TO_QUEUE` 事件）。
 
 新会话对结果未知的命令**按命令版本对账**（`/devices/reconcile`，批量）：
 
@@ -85,7 +91,8 @@ QUEUED（从未发送）─ 会话失效 ─▶ QUEUED_UNKNOWN（冻结，等新
 
 在最低版本的命令结果未知期间，poll **严格按版本补发**：在途命令幂等重发
 （`duplicate_dispatch`，不新增 attempt），对账中的命令返回
-`await_reconcile` 提示，不跳发新版本。直接对 RECONCILING / QUEUED_UNKNOWN
+`await_reconcile` 提示，不跳发新版本；从未发送的 QUEUED 不阻塞——
+但只要还有更低版本在核实，仍按版本顺序等待核实完成。直接对 RECONCILING
 命令发 ACK 会被拒绝（`COMMAND_AWAIT_RECONCILE`），只能走对账。
 
 每条命令的完整过程（创建/派发/确认/转对账/对账完成或重投，含代次与会话）
@@ -134,7 +141,8 @@ QUEUED（从未发送）─ 会话失效 ─▶ QUEUED_UNKNOWN（冻结，等新
 
 所有写接口接受可选 `idempotency_key`：同键同请求体返回首次结果
 （`idempotent_replay=true`）；同键不同请求体返回 409
-`IDEMPOTENCY_CONFLICT`。设备消息另带一层自然幂等：活跃连接编号重复上线、
+`IDEMPOTENCY_CONFLICT`。设备面的幂等重放只在凭证/会话鉴权通过后生效——
+当前可写会话的网络重试正常去重，失效旧连接的重放先被拦截。设备消息另带一层自然幂等：活跃连接编号重复上线、
 活跃会话重复 poll 同一条在途命令、已确认命令重复 ACK、完成后的重复对账，
 都返回重复标记而无副作用。
 
@@ -182,7 +190,7 @@ curl -s -XPOST $B/v1/devices/lamp-1/rotations \
 
 ```bash
 python3 -m unittest discover -s tests
-# 48 个用例：
+# 57 个用例：
 #   test_sessions.py  上线/续期/并发上线/接管/单调代次（含 20 线程并发）
 #   test_rotation.py  轮换、旧凭证受限、宽限到期、管理员撤销、连续轮换
 #   test_commands.py  代次绑定、会话切换三态处置、按版本对账、严格补发

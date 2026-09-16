@@ -54,6 +54,18 @@ class OnlineTests(LeaseTestCase):
         self.assert_rejected(ctx, "DEAD_CONNECTION_REUSED")
         self.assertIn("DEAD_CONNECTION_REUSED", self.rejected_reasons())
 
+    def test_dead_connection_cannot_revive_via_idempotency_replay(self):
+        # 旧通道先用幂等键成功上线；被顶替后拿同一个键重放也必须拦截
+        self.provision()
+        self.open_session(connection_no="c1", idem_key="on-c1")
+        self.open_session(connection_no="c2")
+        with self.assertRaises(LeaseError) as ctx:
+            self.open_session(connection_no="c1", idem_key="on-c1")
+        self.assert_rejected(ctx, "DEAD_CONNECTION_REUSED")
+        rejected = self.db.list_rejected("dev1", kind="ONLINE")
+        self.assertTrue(any(r["reason"] == "DEAD_CONNECTION_REUSED"
+                            for r in rejected))
+
     def test_concurrent_online_generates_new_generation(self):
         self.provision()
         s1 = self.open_session(connection_no="c1")

@@ -134,6 +134,16 @@ class ApiE2ETest(unittest.TestCase):
         self.assertEqual(st, 410)
         self.assertEqual(err["error"], "SESSION_SUPERSEDED")
 
+        # 新通道把 v2 领走（已下达、结果未知）
+        st, p1b = self.call("POST", "/devices/poll", {},
+                            device_auth=auth1b, admin=False)
+        self.assertEqual(st, 200)
+        self.assertEqual(p1b["command"]["version"], 2)
+        # 再下发一条、任何通道都尚未领取的命令（v3）
+        st, c3 = self.call("POST", "/v1/devices/lamp-1/commands",
+                           {"payload": {"color": "blue"}})
+        self.assertEqual(st, 200)
+
         # v2 已被新会话领走：会话切换时在途 -> RECONCILING
         st, tl = self.call("GET", f"/v1/commands/{c1['command_id']}"
                            "/timeline", admin=True)
@@ -178,7 +188,7 @@ class ApiE2ETest(unittest.TestCase):
         self.assertEqual(s3["generation"], 3)
         self.assertIsNotNone(s3.get("rotation_completed"))
 
-        # v2 命令（brightness）在接管时是 SENT/RECONCILING：先对账
+        # v2 命令（brightness）接管时已在途（SENT）：先对账核实
         st, rec = self.call("POST", "/devices/reconcile",
                             {"entries": [{"version": 2, "done": False}]},
                             device_auth=auth2, admin=False)
@@ -191,6 +201,11 @@ class ApiE2ETest(unittest.TestCase):
         st, ack3 = self.call("POST", "/devices/ack", {"version": 2},
                              device_auth=auth2, admin=False)
         self.assertEqual(ack3["state"], "ACKED")
+        # v3 从未下达给任何终端：接管/换通道不要求核实，新通道直接领取
+        st, p3 = self.call("POST", "/devices/poll", {}, device_auth=auth2,
+                           admin=False)
+        self.assertEqual(p3["command"]["version"], 3)
+        self.assertEqual(p3["command"]["payload"], {"color": "blue"})
 
         # 查询面
         st, rm = self.call("GET", "/v1/devices/lamp-1", admin=True)

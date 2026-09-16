@@ -43,11 +43,11 @@ ROT_COMPLETED = "COMPLETED"
 
 # 命令状态
 CMD_QUEUED = "QUEUED"                    # 从未发送 / 对账确认未执行，可派发
-CMD_QUEUED_UNKNOWN = "QUEUED_UNKNOWN"    # 会话切换前从未发送，等待新会话对账表态
+CMD_QUEUED_UNKNOWN = "QUEUED_UNKNOWN"    # 遗留状态：新代码不再产生，启动时迁移回 QUEUED
 CMD_SENT = "SENT"
 CMD_ACKED = "ACKED"
 CMD_RECONCILING = "RECONCILING"
-# 尚未确认终态、需要对账参与才能决定去留的状态
+# 已下达但结果未知、需要对账参与才能决定去留的状态
 CMD_AWAIT_RECONCILE_STATES = (CMD_RECONCILING, CMD_QUEUED_UNKNOWN)
 
 # 接管记录状态
